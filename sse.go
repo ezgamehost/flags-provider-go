@@ -17,11 +17,14 @@ type sseEvent struct {
 }
 
 // sseReader reads the event-stream format (the WHATWG HTML "Server-sent events" parsing rules)
-// from an HTTP body: comments are skipped, lines end in LF or CRLF, and a frame with no data
-// isn't dispatched.
+// from an HTTP body: a leading BOM is stripped, comments are skipped, lines end in LF, CRLF or a
+// lone CR, and a frame with no data isn't dispatched.
 type sseReader struct {
-	br  *bufio.Reader
-	max int // the largest frame accepted, in bytes
+	br      *bufio.Reader
+	max     int    // the largest frame accepted, in bytes
+	onLine  func() // called after every complete line, comments included
+	started bool   // the BOM check is done
+	skipLF  bool   // the last line ended in CR, so a leading LF belongs to it
 }
 
 func newSSEReader(r io.Reader, max int) *sseReader {
@@ -29,6 +32,8 @@ func newSSEReader(r io.Reader, max int) *sseReader {
 }
 
 var errFrameTooLarge = errors.New("ezghflags: stream frame too large")
+
+var bom = []byte("\xEF\xBB\xBF")
 
 // next answers the next dispatched frame. io.EOF ends the stream; a final frame without its
 // blank line is dropped.
@@ -43,6 +48,9 @@ func (s *sseReader) next() (sseEvent, error) {
 		line, err := s.readLine(s.max - size)
 		if err != nil {
 			return sseEvent{}, err
+		}
+		if s.onLine != nil {
+			s.onLine()
 		}
 		size += len(line)
 		if len(line) == 0 {
@@ -80,25 +88,43 @@ func (s *sseReader) next() (sseEvent, error) {
 	}
 }
 
-// readLine reads one line without its LF or CRLF, refusing lines longer than limit.
+// readLine reads one line without its ending (LF, CRLF or CR), refusing lines longer than limit.
+// A line still unterminated at the end of the stream is dropped (io.EOF).
 func (s *sseReader) readLine(limit int) ([]byte, error) {
+	if !s.started {
+		s.started = true
+		if b, _ := s.br.Peek(len(bom)); bytes.Equal(b, bom) {
+			_, _ = s.br.Discard(len(bom))
+		}
+	}
 	var line []byte
 	for {
-		chunk, err := s.br.ReadSlice('\n')
-		if len(line)+len(chunk) > limit+2 {
-			return nil, fmt.Errorf("%w (over %d bytes)", errFrameTooLarge, s.max)
-		}
-		line = append(line, chunk...)
-		switch {
-		case err == nil:
-			line = bytes.TrimSuffix(line[:len(line)-1], []byte("\r"))
-			return line, nil
-		case errors.Is(err, bufio.ErrBufferFull):
-			continue
-		case errors.Is(err, io.EOF):
-			return nil, io.EOF
-		default:
+		if _, err := s.br.Peek(1); err != nil {
 			return nil, err
 		}
+		chunk, _ := s.br.Peek(s.br.Buffered())
+		if s.skipLF {
+			s.skipLF = false
+			if chunk[0] == '\n' {
+				_, _ = s.br.Discard(1)
+				continue
+			}
+		}
+		i := bytes.IndexAny(chunk, "\r\n")
+		n := i
+		if i < 0 {
+			n = len(chunk)
+		}
+		if len(line)+n > limit {
+			return nil, fmt.Errorf("%w (over %d bytes)", errFrameTooLarge, s.max)
+		}
+		line = append(line, chunk[:n]...)
+		if i < 0 {
+			_, _ = s.br.Discard(n)
+			continue
+		}
+		s.skipLF = chunk[i] == '\r'
+		_, _ = s.br.Discard(i + 1)
+		return line, nil
 	}
 }

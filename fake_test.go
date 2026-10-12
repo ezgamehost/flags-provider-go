@@ -75,6 +75,9 @@ type fakeDataPlane struct {
 	streams  map[*fakeStream]struct{}
 	requests []recorded
 	notify   chan struct{}
+	// quirk misbehaves on /v1/sync/stream: "silent" answers 200 text/event-stream and closes
+	// without a byte; "json" answers 200 with Content-Type application/json.
+	quirk string
 }
 
 const (
@@ -242,7 +245,27 @@ func (f *fakeDataPlane) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (f *fakeDataPlane) setQuirk(q string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.quirk = q
+}
+
 func (f *fakeDataPlane) stream(w http.ResponseWriter, r *http.Request, known int64) {
+	f.mu.Lock()
+	quirk := f.quirk
+	f.mu.Unlock()
+	switch quirk {
+	case "silent":
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		return
+	case "json":
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, ": open\n\n")
+		return
+	}
 	s := &fakeStream{frames: make(chan string, 64), drop: make(chan struct{})}
 	f.mu.Lock()
 	f.streams[s] = struct{}{}

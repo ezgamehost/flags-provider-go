@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"runtime/debug"
 	"sort"
+	"strings"
 
 	"github.com/open-feature/flagd/core/pkg/evaluator"
 	"github.com/open-feature/flagd/core/pkg/logger"
@@ -25,6 +28,10 @@ const source = "ezgh"
 type flagMeta struct {
 	version int64
 	enabled bool
+	// definition is the flag's compiled definition in canonical JSON, followed by every
+	// $evaluators entry it references (transitively), so a segment change shows as a change to
+	// the flags that use the segment.
+	definition string
 }
 
 // snapshot is one loaded snapshot (the flagd core's evaluator over its own store). It is
@@ -56,7 +63,8 @@ func loadSnapshot(data []byte) (*snapshot, error) {
 		Metadata struct {
 			SnapshotVersion int64 `json:"snapshotVersion"`
 		} `json:"metadata"`
-		Flags map[string]struct {
+		Evaluators map[string]any `json:"$evaluators"`
+		Flags      map[string]struct {
 			Metadata struct {
 				FlagVersion int64 `json:"flagVersion"`
 				Enabled     *bool `json:"enabled"`
@@ -87,11 +95,58 @@ func loadSnapshot(data []byte) (*snapshot, error) {
 	if err := ev.SetState(fsync.DataSync{FlagData: string(data), Source: source}); err != nil {
 		return nil, fmt.Errorf("ezghflags: flagd rejected the snapshot: %w", err)
 	}
+	var raw struct {
+		Flags map[string]any `json:"flags"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("ezghflags: snapshot isn't JSON: %w", err)
+	}
 	s := &snapshot{ev: ev, version: head.Metadata.SnapshotVersion, flags: map[string]flagMeta{}}
 	for k, f := range head.Flags {
-		s.flags[k] = flagMeta{version: f.Metadata.FlagVersion, enabled: f.Metadata.Enabled == nil || *f.Metadata.Enabled}
+		s.flags[k] = flagMeta{
+			version:    f.Metadata.FlagVersion,
+			enabled:    f.Metadata.Enabled == nil || *f.Metadata.Enabled,
+			definition: definition(raw.Flags[k], head.Evaluators),
+		}
 	}
 	return s, nil
+}
+
+// definition is a flag's canonical JSON (encoding/json sorts object keys) plus the canonical JSON
+// of each evaluator it references through {"$ref": name}, transitively, in name order.
+func definition(flag any, evaluators map[string]any) string {
+	refs := map[string]bool{}
+	var walk func(v any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case map[string]any:
+			if name, ok := t["$ref"].(string); ok && len(t) == 1 && !refs[name] {
+				refs[name] = true
+				walk(evaluators[name])
+			}
+			for _, c := range t {
+				walk(c)
+			}
+		case []any:
+			for _, c := range t {
+				walk(c)
+			}
+		}
+	}
+	walk(flag)
+	var b strings.Builder
+	canon, _ := json.Marshal(flag)
+	b.Write(canon)
+	names := make([]string, 0, len(refs))
+	for n := range refs {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		e, _ := json.Marshal(evaluators[n])
+		fmt.Fprintf(&b, "\n%s=%s", n, e)
+	}
+	return b.String()
 }
 
 // evaluate evaluates one flag for evalCtx, which it never stores or logs. An off config
@@ -122,18 +177,18 @@ func (s *snapshot) evaluate(ctx context.Context, key string, evalCtx map[string]
 	return anyResult{value: r.Value, variant: r.Variant, reason: reason, flagVersion: m.version}
 }
 
-// flagVersions maps each flag key to its config version (metadata.flagVersion).
-func (s *snapshot) flagVersions() map[string]int64 {
-	out := make(map[string]int64, len(s.flags))
+// definitions maps each flag key to its compiled definition (see flagMeta.definition).
+func (s *snapshot) definitions() map[string]string {
+	out := make(map[string]string, len(s.flags))
 	for k, m := range s.flags {
-		out[k] = m.version
+		out[k] = m.definition
 	}
 	return out
 }
 
-// changedKeys are the keys whose flagVersion differs between before and after, or that are in
-// only one of them, sorted.
-func changedKeys(before, after map[string]int64) []string {
+// changedKeys are the keys whose compiled definition differs between before and after, or that
+// are in only one of them, sorted.
+func changedKeys(before, after map[string]string) []string {
 	var out []string
 	for k, v := range after {
 		if old, ok := before[k]; !ok || old != v {
@@ -147,4 +202,44 @@ func changedKeys(before, after map[string]int64) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// pinnedCores are the evaluator modules the conformance vectors were verified with. A different
+// version can evaluate differently (flags-stack protocol/README.md, "Cross-core semantics").
+var pinnedCores = map[string]string{
+	"github.com/open-feature/flagd/core":     "v0.18.0",
+	"github.com/diegoholiveira/jsonlogic/v3": "v3.9.1",
+}
+
+// unpinnedCores lists the evaluator modules in deps whose version isn't the pinned one, as
+// "path version (tested pinned)".
+func unpinnedCores(deps []*debug.Module) []string {
+	var out []string
+	for _, m := range deps {
+		want, ok := pinnedCores[m.Path]
+		if !ok {
+			continue
+		}
+		v := m.Version
+		if m.Replace != nil {
+			v = m.Replace.Version
+		}
+		if v != want {
+			out = append(out, fmt.Sprintf("%s %s (tested %s)", m.Path, v, want))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// warnUnpinnedCores logs a warning when the binary resolved an evaluator module to a version
+// other than the tested one (Go's minimal version selection lets another dependency raise it).
+func warnUnpinnedCores(logger *slog.Logger) {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return
+	}
+	if diff := unpinnedCores(info.Deps); len(diff) > 0 {
+		logger.Warn("ezghflags: flag evaluation runs on untested evaluator versions; results may differ from the EZGH data plane", "modules", strings.Join(diff, ", "))
+	}
 }

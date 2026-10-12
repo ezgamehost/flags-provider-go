@@ -77,6 +77,21 @@ func TestSSE(t *testing.T) {
 			want: []sseEvent{{event: "snapshot", id: "4", data: "a\nb"}},
 		},
 		{
+			name: "lone CR line endings",
+			in:   strings.NewReader("event: snapshot\rid: 5\rdata: a\rdata: b\r\r: c\r\revent: end\r\ndata: {}\n\r\n"),
+			want: []sseEvent{{event: "snapshot", id: "5", data: "a\nb"}, {event: "end", data: "{}"}},
+		},
+		{
+			name: "CRLF split between reads",
+			in:   &chunks{parts: []string{"data: a\r", "\ndata: b\r", "\n\r", "\n"}},
+			want: []sseEvent{{event: "message", data: "a\nb"}},
+		},
+		{
+			name: "a leading BOM is stripped",
+			in:   strings.NewReader("\xEF\xBB\xBFevent: x\ndata: y\n\n"),
+			want: []sseEvent{{event: "x", data: "y"}},
+		},
+		{
 			name: "only one leading space is stripped; a field without a colon is empty",
 			in:   strings.NewReader("data:  two spaces\ndata\n\n"),
 			want: []sseEvent{{event: "message", data: " two spaces\n"}},

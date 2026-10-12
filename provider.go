@@ -19,6 +19,7 @@ import (
 	"io"
 	"math"
 	"math/rand/v2"
+	"mime"
 	"net/http"
 	"os"
 	"strconv"
@@ -209,8 +210,9 @@ func (p *Provider) InitWithContext(ctx context.Context, _ openfeature.Evaluation
 	p.life.Lock()
 	defer p.life.Unlock()
 	if p.cancel != nil {
-		return nil
+		return p.currentState()
 	}
+	warnUnpinnedCores(p.cfg.logger)
 	if p.cfg.offline {
 		if p.cfg.bootstrapPath == "" {
 			return &openfeature.ProviderInitError{ErrorCode: openfeature.ProviderFatalCode, Message: "ezghflags: WithOffline needs WithBootstrapFile"}
@@ -321,7 +323,7 @@ func parseRetryAfter(v string, now time.Time) time.Duration {
 }
 
 // backoff is the delay before retry number n (1-based): exponential from minBackoff to
-// maxBackoff, with jitter (half fixed, half random), and at least retryAfter.
+// maxBackoff, with jitter (half fixed, half random), and at least retryAfter plus 0–20 %.
 func (p *Provider) backoff(n int, retryAfter time.Duration) time.Duration {
 	d := p.cfg.minBackoff
 	for i := 1; i < n && d < p.cfg.maxBackoff; i++ {
@@ -329,7 +331,16 @@ func (p *Provider) backoff(n int, retryAfter time.Duration) time.Duration {
 	}
 	d = min(d, p.cfg.maxBackoff)
 	d = d/2 + rand.N(d/2+1)
-	return max(d, retryAfter)
+	return max(d, jitterUp(retryAfter))
+}
+
+// jitterUp adds 0–20 % to a Retry-After wait, so clients told the same moment don't return
+// together.
+func jitterUp(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return d + rand.N(d/5+1)
 }
 
 // sleep waits d or until ctx ends, answering false when it ended.
@@ -370,7 +381,8 @@ func (p *Provider) firstFetch(ctx context.Context) error {
 
 // fetch GETs /v1/sync/snapshot with If-None-Match and applies a new snapshot. It answers whether
 // the snapshot changed. During Init (initial), the first snapshot emits no event: OpenFeature
-// emits PROVIDER_READY when Init returns.
+// emits PROVIDER_READY when Init returns. (Accepted race: a stream event emitted while OpenFeature
+// is still finishing Init can be delivered before its PROVIDER_READY.)
 func (p *Provider) fetch(ctx context.Context, initial bool) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.fetchTimeout)
 	defer cancel()
@@ -414,8 +426,8 @@ func (p *Provider) authorize(req *http.Request) {
 
 // apply loads data and swaps it in. A snapshot that doesn't load is logged and dropped, keeping
 // the current one. The first snapshot after a failed Init emits PROVIDER_READY; later ones emit
-// PROVIDER_CONFIGURATION_CHANGED with the keys whose flagVersion changed or that appeared or
-// disappeared.
+// PROVIDER_CONFIGURATION_CHANGED on every new version, with the keys whose compiled definition
+// changed or that appeared or disappeared (possibly none) and the snapshotVersion.
 func (p *Provider) apply(data []byte, readyEvent bool) (bool, error) {
 	s, err := loadSnapshot(data)
 	if err != nil {
@@ -425,7 +437,9 @@ func (p *Provider) apply(data []byte, readyEvent bool) (bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	old := p.snap.Load()
-	if p.netVersion.Load() == s.version {
+	// Never go back: a snapshot older than the one held (a lagging pod or replica) is ignored.
+	// A bootstrap file's version doesn't count, since it may be from elsewhere.
+	if cur := p.netVersion.Load(); cur > 0 && s.version <= cur {
 		return false, nil
 	}
 	p.snap.Store(s)
@@ -438,7 +452,7 @@ func (p *Provider) apply(data []byte, readyEvent bool) (bool, error) {
 	}
 	p.emit(openfeature.ProviderConfigChange, openfeature.ProviderEventDetails{
 		Message:       fmt.Sprintf("snapshot %d", s.version),
-		FlagChanges:   changedKeys(old.flagVersions(), s.flagVersions()),
+		FlagChanges:   changedKeys(old.definitions(), s.definitions()),
 		EventMetadata: map[string]any{"snapshotVersion": s.version},
 	})
 	return true, nil
@@ -530,12 +544,15 @@ func (p *Provider) run(ctx context.Context, done chan struct{}) {
 			return
 		}
 		if err == nil {
-			// An end event. revoked is fatal at once; rotate reconnects at once; anything else
-			// (shutdown, environmentDeleted) waits a moment, then reconnects to another pod (a
-			// deleted environment's key then gets 401).
+			// An end event. revoked and environmentDeleted are fatal at once; rotate reconnects at
+			// once; anything else (shutdown) waits a moment, then reconnects to another pod.
 			failures = 0
-			if end == "revoked" {
+			switch end {
+			case "revoked":
 				p.setFatal(errors.New("ezghflags: the SDK key was revoked"))
+				return
+			case "environmentDeleted":
+				p.setFatal(errors.New("ezghflags: the SDK key's environment was deleted"))
 				return
 			}
 			if end != "rotate" && !sleep(ctx, p.backoff(1, 0)) {
@@ -577,8 +594,8 @@ func (p *Provider) run(ctx context.Context, done chan struct{}) {
 					p.markUp()
 				} else {
 					p.markDown(ctx)
-					if errors.As(perr, &re) && re.retryAfter > p.cfg.pollEvery {
-						nextPoll = time.Now().Add(re.retryAfter)
+					if errors.As(perr, &re) && re.retryAfter > 0 {
+						nextPoll = time.Now().Add(max(p.cfg.pollEvery, jitterUp(re.retryAfter)))
 					}
 				}
 				now = time.Now()
@@ -623,20 +640,30 @@ func (p *Provider) stream(ctx context.Context) (end string, connected bool, err 
 	if resp.StatusCode != http.StatusOK {
 		return "", false, statusError(resp, "stream")
 	}
-	p.markUp()
+	if mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mt != "text/event-stream" {
+		return "", false, &retryError{err: fmt.Errorf("ezghflags: stream: Content-Type %q isn't text/event-stream", resp.Header.Get("Content-Type"))}
+	}
 
 	// The data plane sends a heartbeat comment every 15 s; a stream silent for idleTimeout is
 	// dead (a half-open connection), so it's dropped.
 	idle := time.AfterFunc(p.cfg.idleTimeout, cancel)
 	defer idle.Stop()
 	sr := newSSEReader(&idleReader{r: resp.Body, t: idle, d: p.cfg.idleTimeout}, maxSnapshotBytes+(1<<10))
+	// The stream counts as connected (failures reset, STALE cleared) from its first frame or
+	// comment: the data plane opens with ": open".
+	sr.onLine = func() {
+		if !connected {
+			connected = true
+			p.markUp()
+		}
+	}
 	for {
 		ev, err := sr.next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				err = io.ErrUnexpectedEOF
 			}
-			return "", true, &retryError{err: fmt.Errorf("ezghflags: stream: %w", err)}
+			return "", connected, &retryError{err: fmt.Errorf("ezghflags: stream: %w", err)}
 		}
 		switch ev.event {
 		case "snapshot":
@@ -646,7 +673,7 @@ func (p *Provider) stream(ctx context.Context) (end string, connected bool, err 
 				Reason string `json:"reason"`
 			}
 			_ = json.Unmarshal([]byte(ev.data), &e)
-			return e.Reason, true, nil
+			return e.Reason, connected, nil
 		}
 	}
 }
@@ -665,3 +692,31 @@ func (r *idleReader) Read(b []byte) (int, error) {
 	}
 	return n, err
 }
+
+// currentState answers a repeated Init while the provider runs, so OpenFeature records its real
+// state: fatal stays FATAL, no snapshot yet is an error, and a stale provider answers nil (the SDK
+// then marks it READY) and re-emits PROVIDER_STALE just after.
+func (p *Provider) currentState() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch {
+	case p.fatal:
+		return &openfeature.ProviderInitError{ErrorCode: openfeature.ProviderFatalCode, Message: "ezghflags: the data plane refused the SDK key"}
+	case p.snap.Load() == nil:
+		return &openfeature.ProviderInitError{ErrorCode: openfeature.GeneralCode, Message: "ezghflags: no snapshot loaded yet; still trying"}
+	case p.stale:
+		// OpenFeature emits PROVIDER_READY when Init returns; emitting STALE now could be
+		// overtaken by it, so it's sent a moment later (if still stale).
+		time.AfterFunc(restaleDelay, func() {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if p.stale && !p.fatal {
+				p.emit(openfeature.ProviderStale, openfeature.ProviderEventDetails{Message: "disconnected from the data plane; evaluating the last snapshot"})
+			}
+		})
+	}
+	return nil
+}
+
+// restaleDelay is how long after a repeated Init a stale provider re-emits PROVIDER_STALE.
+const restaleDelay = 50 * time.Millisecond

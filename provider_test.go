@@ -2,6 +2,7 @@ package ezghflags
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -515,11 +517,11 @@ func TestShutdownStops(t *testing.T) {
 }
 
 func TestChangedKeys(t *testing.T) {
-	got := changedKeys(map[string]int64{"a": 1, "b": 2, "gone": 1}, map[string]int64{"a": 1, "b": 3, "new": 1})
+	got := changedKeys(map[string]string{"a": "1", "b": "2", "gone": "1"}, map[string]string{"a": "1", "b": "3", "new": "1"})
 	if want := []string{"b", "gone", "new"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("changedKeys = %v, want %v", got, want)
 	}
-	if got := changedKeys(map[string]int64{"a": 1}, map[string]int64{"a": 1}); len(got) != 0 {
+	if got := changedKeys(map[string]string{"a": "1"}, map[string]string{"a": "1"}); len(got) != 0 {
 		t.Fatalf("no change = %v", got)
 	}
 }
@@ -558,7 +560,7 @@ func TestSegmentOnlyChangeStillNotifies(t *testing.T) {
 	}
 }
 
-func TestEndEnvironmentDeletedThen401IsFatal(t *testing.T) {
+func TestEndEnvironmentDeletedIsFatal(t *testing.T) {
 	fake := newFakeDataPlane(t, testKey, snapshotJSON(1, testFlag{"a", true, 1}), 1)
 	_, client, events, err := setup(t, fake, testKey)
 	if err != nil {
@@ -573,7 +575,217 @@ func TestEndEnvironmentDeletedThen401IsFatal(t *testing.T) {
 	if client.State() != openfeature.FatalState {
 		t.Fatalf("state = %s", client.State())
 	}
-	if n := len(fake.requestsTo(streamPath)); n != 2 {
-		t.Fatalf("%d stream requests, want 2", n)
+	time.Sleep(100 * time.Millisecond)
+	if n := len(fake.requestsTo(streamPath)); n != 1 {
+		t.Fatalf("%d stream requests, want 1 (fatal at once)", n)
+	}
+}
+
+// segmentSnapshot is a snapshot whose flag "gated" serves true to the targeting keys in the
+// "beta" evaluator, and whose flag "plain" doesn't use it.
+func segmentSnapshot(version int64, beta ...string) []byte {
+	b, err := json.Marshal(map[string]any{
+		"$schema":     "https://flagd.dev/schema/v0/flags.json",
+		"metadata":    map[string]any{"environmentId": "e", "snapshotVersion": version, "compiledAt": "2026-10-12T09:00:00Z"},
+		"$evaluators": map[string]any{"beta": map[string]any{"in": []any{map[string]any{"var": "targetingKey"}, beta}}},
+		"flags": map[string]any{
+			"gated": map[string]any{
+				"state": "ENABLED", "variants": map[string]any{"false": false, "true": true}, "defaultVariant": "false",
+				"metadata":  map[string]any{"flagVersion": 1, "enabled": true},
+				"targeting": map[string]any{"if": []any{map[string]any{"$ref": "beta"}, "true"}},
+			},
+			"plain": map[string]any{
+				"state": "ENABLED", "variants": map[string]any{"false": false, "true": true}, "defaultVariant": "true",
+				"metadata": map[string]any{"flagVersion": 1, "enabled": true},
+			},
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func TestFlagChangesFollowCompiledDefinitions(t *testing.T) {
+	fake := newFakeDataPlane(t, testKey, segmentSnapshot(1, "user-1"), 1)
+	_, client, events, err := setup(t, fake, testKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStreams(t, fake, 1)
+	// A segment change: no flagVersion changes, but "gated" evaluates differently.
+	fake.setSnapshot(segmentSnapshot(2, "user-2"), 2)
+	e := events.next(t, openfeature.ProviderConfigChange)
+	if !reflect.DeepEqual(e.FlagChanges, []string{"gated"}) || e.EventMetadata["snapshotVersion"] != int64(2) {
+		t.Fatalf("event = %+v", e)
+	}
+	if boolValue(t, client, "gated") {
+		t.Fatal("user-1 is no longer in the segment")
+	}
+	// A definition change with the same flagVersion.
+	fake.setSnapshot(snapshotJSON(3, testFlag{"gated", true, 1}, testFlag{"plain", false, 1}), 3)
+	if e := events.next(t, openfeature.ProviderConfigChange); !reflect.DeepEqual(e.FlagChanges, []string{"gated", "plain"}) {
+		t.Fatalf("flags changed = %v", e.FlagChanges)
+	}
+}
+
+func TestOlderSnapshotIgnored(t *testing.T) {
+	fake := newFakeDataPlane(t, testKey, snapshotJSON(5, testFlag{"a", true, 5}), 5)
+	_, client, events, err := setup(t, fake, testKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStreams(t, fake, 1)
+	fake.setSnapshot(snapshotJSON(4, testFlag{"a", false, 4}), 4)
+	events.none(t, openfeature.ProviderConfigChange, 100*time.Millisecond)
+	if !boolValue(t, client, "a") {
+		t.Fatal("installed an older snapshot")
+	}
+	fake.setSnapshot(snapshotJSON(6, testFlag{"a", false, 6}), 6)
+	events.next(t, openfeature.ProviderConfigChange)
+	if boolValue(t, client, "a") {
+		t.Fatal("the newer snapshot isn't evaluated")
+	}
+}
+
+func TestConnectedOnlyAfterTheFirstFrame(t *testing.T) {
+	for _, quirk := range []string{"silent", "json"} {
+		t.Run(quirk, func(t *testing.T) {
+			fake := newFakeDataPlane(t, testKey, snapshotJSON(1, testFlag{"a", true, 1}), 1)
+			_, client, events, err := setup(t, fake, testKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitStreams(t, fake, 1)
+			fake.failPath(snapshotPath, http.StatusServiceUnavailable, "", 0)
+			fake.setQuirk(quirk)
+			fake.dropStreams()
+			// Every stream answers 200 but never delivers a frame (or isn't an event stream), so
+			// failures count up: polling starts, and the provider goes stale.
+			events.next(t, openfeature.ProviderStale)
+			fake.waitFor("polling", 5*time.Second, func() bool { return len(fake.requestsTo(snapshotPath)) >= 2 })
+			fake.setQuirk("")
+			fake.clearFailures()
+			events.next(t, openfeature.ProviderReady)
+			if client.State() != openfeature.ReadyState {
+				t.Fatalf("state = %s", client.State())
+			}
+		})
+	}
+}
+
+func TestPollingHonoursRetryAfter(t *testing.T) {
+	fake := newFakeDataPlane(t, testKey, snapshotJSON(1, testFlag{"a", true, 1}), 1)
+	_, _, _, err := setup(t, fake, testKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStreams(t, fake, 1)
+	fake.failPath(streamPath, http.StatusServiceUnavailable, "", 0)
+	fake.failPath(snapshotPath, http.StatusTooManyRequests, "1", 0)
+	fake.dropStreams()
+	fake.waitFor("two polls", 5*time.Second, func() bool { return len(fake.requestsTo(snapshotPath)) >= 3 })
+	polls := fake.requestsTo(snapshotPath)[1:]
+	if gap := polls[1].at.Sub(polls[0].at); gap < 950*time.Millisecond {
+		t.Fatalf("polled again after %s despite Retry-After: 1", gap)
+	}
+}
+
+func TestRetryAfterJitter(t *testing.T) {
+	p := New(testKey, fast)
+	for range 200 {
+		d := p.backoff(1, time.Second)
+		if d < time.Second || d > 1200*time.Millisecond {
+			t.Fatalf("backoff with Retry-After 1s = %s, want 1s–1.2s", d)
+		}
+	}
+	if jitterUp(0) != 0 {
+		t.Fatal("jitterUp(0) != 0")
+	}
+}
+
+func TestRepeatedInitAnswersTheCurrentState(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("fatal", func(t *testing.T) {
+		fake := newFakeDataPlane(t, testKey, snapshotJSON(1, testFlag{"a", true, 1}), 1)
+		api := isolated.NewAPI()
+		t.Cleanup(func() { _ = api.Shutdown(ctx) })
+		events := watchEvents(api)
+		p := New(testKey, WithEndpoint(fake.url()), fast)
+		if err := api.SetProviderAndWait(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+		waitStreams(t, fake, 1)
+		fake.endStreams("revoked")
+		events.next(t, openfeature.ProviderError)
+		err := api.SetProviderAndWait(ctx, p, openfeature.WithDomain("second"))
+		var ie *openfeature.ProviderInitError
+		if !errors.As(err, &ie) || ie.ErrorCode != openfeature.ProviderFatalCode {
+			t.Fatalf("second init = %v", err)
+		}
+		if s := api.NewClient(openfeature.WithDomain("second")).State(); s != openfeature.FatalState {
+			t.Fatalf("second domain state = %s", s)
+		}
+	})
+
+	t.Run("no snapshot yet", func(t *testing.T) {
+		fake := newFakeDataPlane(t, testKey, snapshotJSON(1, testFlag{"a", true, 1}), 1)
+		fake.failPath(snapshotPath, http.StatusServiceUnavailable, "", 0)
+		fake.failPath(streamPath, http.StatusServiceUnavailable, "", 0)
+		p := New(testKey, WithEndpoint(fake.url()), fast)
+		defer p.Shutdown()
+		if err := p.InitWithContext(ctx, openfeature.EvaluationContext{}); err == nil {
+			t.Fatal("first init succeeded")
+		}
+		err := p.InitWithContext(ctx, openfeature.EvaluationContext{})
+		var ie *openfeature.ProviderInitError
+		if !errors.As(err, &ie) || ie.ErrorCode != openfeature.GeneralCode {
+			t.Fatalf("second init = %v", err)
+		}
+	})
+
+	t.Run("stale", func(t *testing.T) {
+		fake := newFakeDataPlane(t, testKey, snapshotJSON(1, testFlag{"a", true, 1}), 1)
+		api := isolated.NewAPI()
+		t.Cleanup(func() { _ = api.Shutdown(ctx) })
+		events := watchEvents(api)
+		p := New(testKey, WithEndpoint(fake.url()), fast)
+		if err := api.SetProviderAndWait(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+		waitStreams(t, fake, 1)
+		fake.failPath(snapshotPath, http.StatusServiceUnavailable, "", 0)
+		fake.failPath(streamPath, http.StatusServiceUnavailable, "", 0)
+		fake.dropStreams()
+		events.next(t, openfeature.ProviderStale)
+		if err := api.SetProviderAndWait(ctx, p, openfeature.WithDomain("second")); err != nil {
+			t.Fatalf("second init = %v", err)
+		}
+		events.next(t, openfeature.ProviderStale)
+		if s := api.NewClient(openfeature.WithDomain("second")).State(); s != openfeature.StaleState {
+			t.Fatalf("second domain state = %s", s)
+		}
+	})
+}
+
+func TestUnpinnedCores(t *testing.T) {
+	deps := []*debug.Module{
+		{Path: "github.com/open-feature/flagd/core", Version: "v0.18.0"},
+		{Path: "github.com/diegoholiveira/jsonlogic/v3", Version: "v3.10.0"},
+		{Path: "example.com/other", Version: "v1.0.0"},
+	}
+	if got := unpinnedCores(deps); !reflect.DeepEqual(got, []string{"github.com/diegoholiveira/jsonlogic/v3 v3.10.0 (tested v3.9.1)"}) {
+		t.Fatalf("unpinnedCores = %v", got)
+	}
+	deps[1].Replace = &debug.Module{Path: "github.com/diegoholiveira/jsonlogic/v3", Version: "v3.9.1"}
+	if got := unpinnedCores(deps); len(got) != 0 {
+		t.Fatalf("replaced to the pinned version: %v", got)
+	}
+	// This module's own build resolves the pinned versions.
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if got := unpinnedCores(info.Deps); len(got) != 0 {
+			t.Fatalf("this module resolves untested cores: %v", got)
+		}
 	}
 }

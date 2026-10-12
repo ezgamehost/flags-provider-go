@@ -76,20 +76,35 @@ value, and `DEFAULT` when rules exist and none matched. `FlagMetadata["flagVersi
   the error (state `ERROR`), the provider keeps trying in the background, and it emits
   `PROVIDER_READY` when a snapshot arrives.
 - It then follows the snapshot stream (`POST /v1/sync/stream`), which sends the whole snapshot
-  on every change. Each new snapshot emits `PROVIDER_CONFIGURATION_CHANGED`, with the keys whose
-  `flagVersion` changed or that appeared or disappeared in `FlagChanges`. A segment change can
-  change evaluations without changing any flag's version, so the event fires for every new
-  snapshot.
-- The stream is retried with exponential backoff and jitter (1 s to 60 s, at least
-  `Retry-After`). After three failures in a row, the provider also polls the snapshot every 30
-  seconds with `If-None-Match` until the stream is back.
+  on every change. Each new snapshot version emits `PROVIDER_CONFIGURATION_CHANGED`, with
+  `snapshotVersion` in `EventMetadata` and, in `FlagChanges`, every flag whose compiled definition
+  changed (a segment change lists the flags that use the segment) or that appeared or
+  disappeared. `FlagChanges` can be empty. A snapshot older than the one held is ignored.
+- The stream is retried with exponential backoff and jitter (1 s to 60 s, and never sooner than
+  `Retry-After` plus 0–20 %). A stream counts as connected once its first frame or comment
+  arrives (and only with `Content-Type: text/event-stream`). After three failures in a row, the
+  provider also polls the snapshot every 30 seconds with `If-None-Match` (also honouring
+  `Retry-After`) until the stream is back; a successful poll counts as connected.
 - **Disconnected** for 30 seconds, it emits `PROVIDER_STALE` and keeps evaluating its last
   snapshot; it emits `PROVIDER_READY` when it reconnects.
 - **A refused key** (`401` or `403`: a revoked key, a deleted environment, a client key) or a
-  stream ending with `revoked` is fatal: `PROVIDER_ERROR` with `PROVIDER_FATAL`, and the provider
+  stream ending with `revoked` or `environmentDeleted` is fatal: `PROVIDER_ERROR` with `PROVIDER_FATAL`, and the provider
   stops calling. OpenFeature then answers defaults.
 - A bootstrap file's version is never sent to the data plane (as the stream's `version` or
   `If-None-Match`), so the first connection always loads the data plane's own snapshot.
+
+- Calling `Init` again on a running provider (binding it to another domain) answers its current
+  state: fatal stays fatal, no snapshot yet is an error, and a stale provider re-emits
+  `PROVIDER_STALE`.
+
+### Evaluator versions
+
+The provider is tested against `github.com/open-feature/flagd/core` v0.18.0 and
+`github.com/diegoholiveira/jsonlogic/v3` v3.9.1, the versions EZGH's data plane runs, and its
+`go.mod` requires exactly those. **Don't upgrade them independently** in your module: another
+version can evaluate some rules differently from the data plane. If your build resolves other
+versions (Go's minimal version selection lets another dependency raise them), the provider logs a
+warning at Init. Upgrade this provider instead when a release moves them.
 
 The provider holds one thing in memory: the environment's current snapshot. It never stores or
 logs evaluation contexts.
