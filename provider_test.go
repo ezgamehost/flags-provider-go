@@ -581,18 +581,18 @@ func TestEndEnvironmentDeletedIsFatal(t *testing.T) {
 	}
 }
 
-// segmentSnapshot is a snapshot whose flag "gated" serves true to the targeting keys in the
-// "beta" evaluator, and whose flag "plain" doesn't use it.
+// segmentSnapshot is a snapshot whose flag "gated" serves true to the targeting keys of a
+// segment, inlined into its targeting as the compiler does, and whose flag "plain" uses none.
 func segmentSnapshot(version int64, beta ...string) []byte {
+	segment := map[string]any{"in": []any{map[string]any{"var": "targetingKey"}, beta}}
 	b, err := json.Marshal(map[string]any{
-		"$schema":     "https://flagd.dev/schema/v0/flags.json",
-		"metadata":    map[string]any{"environmentId": "e", "snapshotVersion": version, "compiledAt": "2026-10-12T09:00:00Z"},
-		"$evaluators": map[string]any{"beta": map[string]any{"in": []any{map[string]any{"var": "targetingKey"}, beta}}},
+		"$schema":  "https://flagd.dev/schema/v0/flags.json",
+		"metadata": map[string]any{"environmentId": "e", "snapshotVersion": version, "compiledAt": "2026-10-12T09:00:00Z"},
 		"flags": map[string]any{
 			"gated": map[string]any{
 				"state": "ENABLED", "variants": map[string]any{"false": false, "true": true}, "defaultVariant": "false",
 				"metadata":  map[string]any{"flagVersion": 1, "enabled": true},
-				"targeting": map[string]any{"if": []any{map[string]any{"$ref": "beta"}, "true"}},
+				"targeting": map[string]any{"if": []any{segment, "true"}},
 			},
 			"plain": map[string]any{
 				"state": "ENABLED", "variants": map[string]any{"false": false, "true": true}, "defaultVariant": "true",

@@ -28,9 +28,8 @@ const source = "ezgh"
 type flagMeta struct {
 	version int64
 	enabled bool
-	// definition is the flag's compiled definition in canonical JSON, followed by every
-	// $evaluators entry it references (transitively), so a segment change shows as a change to
-	// the flags that use the segment.
+	// definition is the flag's compiled definition in canonical JSON. The compiler inlines
+	// segments into each flag's targeting, so a segment change changes the flags that use it.
 	definition string
 }
 
@@ -63,8 +62,7 @@ func loadSnapshot(data []byte) (*snapshot, error) {
 		Metadata struct {
 			SnapshotVersion int64 `json:"snapshotVersion"`
 		} `json:"metadata"`
-		Evaluators map[string]any `json:"$evaluators"`
-		Flags      map[string]struct {
+		Flags map[string]struct {
 			Metadata struct {
 				FlagVersion int64 `json:"flagVersion"`
 				Enabled     *bool `json:"enabled"`
@@ -106,47 +104,16 @@ func loadSnapshot(data []byte) (*snapshot, error) {
 		s.flags[k] = flagMeta{
 			version:    f.Metadata.FlagVersion,
 			enabled:    f.Metadata.Enabled == nil || *f.Metadata.Enabled,
-			definition: definition(raw.Flags[k], head.Evaluators),
+			definition: definition(raw.Flags[k]),
 		}
 	}
 	return s, nil
 }
 
-// definition is a flag's canonical JSON (encoding/json sorts object keys) plus the canonical JSON
-// of each evaluator it references through {"$ref": name}, transitively, in name order.
-func definition(flag any, evaluators map[string]any) string {
-	refs := map[string]bool{}
-	var walk func(v any)
-	walk = func(v any) {
-		switch t := v.(type) {
-		case map[string]any:
-			if name, ok := t["$ref"].(string); ok && len(t) == 1 && !refs[name] {
-				refs[name] = true
-				walk(evaluators[name])
-			}
-			for _, c := range t {
-				walk(c)
-			}
-		case []any:
-			for _, c := range t {
-				walk(c)
-			}
-		}
-	}
-	walk(flag)
-	var b strings.Builder
+// definition is a flag's canonical JSON (encoding/json sorts object keys).
+func definition(flag any) string {
 	canon, _ := json.Marshal(flag)
-	b.Write(canon)
-	names := make([]string, 0, len(refs))
-	for n := range refs {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	for _, n := range names {
-		e, _ := json.Marshal(evaluators[n])
-		fmt.Fprintf(&b, "\n%s=%s", n, e)
-	}
-	return b.String()
+	return string(canon)
 }
 
 // evaluate evaluates one flag for evalCtx, which it never stores or logs. An off config

@@ -10,7 +10,7 @@ go get github.com/ezgamehost/flags-provider-go@v0.1.0
 ```
 
 **Status:** in development (EZGH Feature Flags isn't launched yet). Every conformance vector in
-flags-stack's `protocol/vectors/eval` (1,210 cases at `.flags-stack-rev`) passes through this
+flags-stack's `protocol/vectors/eval` (1,340 cases at `.flags-stack-rev`) passes through this
 provider.
 
 ## Usage
