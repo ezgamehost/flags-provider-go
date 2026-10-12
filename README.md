@@ -80,8 +80,11 @@ value, and `DEFAULT` when rules exist and none matched. `FlagMetadata["flagVersi
   `snapshotVersion` in `EventMetadata` and, in `FlagChanges`, every flag whose compiled definition
   changed (a segment change lists the flags that use the segment) or that appeared or
   disappeared. `FlagChanges` can be empty. A snapshot older than the one held is ignored.
-- The stream is retried with exponential backoff and jitter (1 s to 60 s, and never sooner than
-  `Retry-After` plus 0–20 %). A stream counts as connected once its first frame or comment
+- The stream ends every 10 minutes (`rotate`), and the provider reconnects at once; after
+  `shutdown` (a data-plane pod stopping) it waits a moment, then reconnects. Any other end reason
+  counts as a failure.
+- A failed stream is retried with exponential backoff and jitter (1 s to 60 s, and never sooner
+  than `Retry-After`, capped at 60 s, plus 0–20 %). A stream counts as connected once its first frame or comment
   arrives (and only with `Content-Type: text/event-stream`). After three failures in a row, the
   provider also polls the snapshot every 30 seconds with `If-None-Match` (also honouring
   `Retry-After`) until the stream is back; a successful poll counts as connected.

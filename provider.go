@@ -323,7 +323,8 @@ func parseRetryAfter(v string, now time.Time) time.Duration {
 }
 
 // backoff is the delay before retry number n (1-based): exponential from minBackoff to
-// maxBackoff, with jitter (half fixed, half random), and at least retryAfter plus 0–20 %.
+// maxBackoff, with jitter (half fixed, half random), and at least retryAfter (capped at
+// maxBackoff) plus 0–20 %.
 func (p *Provider) backoff(n int, retryAfter time.Duration) time.Duration {
 	d := p.cfg.minBackoff
 	for i := 1; i < n && d < p.cfg.maxBackoff; i++ {
@@ -331,8 +332,11 @@ func (p *Provider) backoff(n int, retryAfter time.Duration) time.Duration {
 	}
 	d = min(d, p.cfg.maxBackoff)
 	d = d/2 + rand.N(d/2+1)
-	return max(d, jitterUp(retryAfter))
+	return max(d, jitterUp(p.capRetryAfter(retryAfter)))
 }
+
+// capRetryAfter bounds a Retry-After wait by maxBackoff.
+func (p *Provider) capRetryAfter(d time.Duration) time.Duration { return min(d, p.cfg.maxBackoff) }
 
 // jitterUp adds 0–20 % to a Retry-After wait, so clients told the same moment don't return
 // together.
@@ -545,8 +549,8 @@ func (p *Provider) run(ctx context.Context, done chan struct{}) {
 		}
 		if err == nil {
 			// An end event. revoked and environmentDeleted are fatal at once; rotate reconnects at
-			// once; anything else (shutdown) waits a moment, then reconnects to another pod.
-			failures = 0
+			// once; shutdown waits a short jittered moment, then reconnects to another pod. Any
+			// other reason is a failure, with backoff.
 			switch end {
 			case "revoked":
 				p.setFatal(errors.New("ezghflags: the SDK key was revoked"))
@@ -554,11 +558,17 @@ func (p *Provider) run(ctx context.Context, done chan struct{}) {
 			case "environmentDeleted":
 				p.setFatal(errors.New("ezghflags: the SDK key's environment was deleted"))
 				return
+			case "rotate":
+				failures = 0
+				continue
+			case "shutdown":
+				failures = 0
+				if !sleep(ctx, p.backoff(1, 0)) {
+					return
+				}
+				continue
 			}
-			if end != "rotate" && !sleep(ctx, p.backoff(1, 0)) {
-				return
-			}
-			continue
+			err, connected = &retryError{err: fmt.Errorf("ezghflags: stream ended with unknown reason %q", end)}, false
 		}
 		if connected {
 			failures = 0
@@ -595,7 +605,7 @@ func (p *Provider) run(ctx context.Context, done chan struct{}) {
 				} else {
 					p.markDown(ctx)
 					if errors.As(perr, &re) && re.retryAfter > 0 {
-						nextPoll = time.Now().Add(max(p.cfg.pollEvery, jitterUp(re.retryAfter)))
+						nextPoll = time.Now().Add(max(p.cfg.pollEvery, jitterUp(p.capRetryAfter(re.retryAfter))))
 					}
 				}
 				now = time.Now()

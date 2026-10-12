@@ -330,7 +330,7 @@ func TestFatalWhenRevoked(t *testing.T) {
 func TestHonoursRetryAfter(t *testing.T) {
 	fake := newFakeDataPlane(t, testKey, snapshotJSON(1, testFlag{"a", true, 1}), 1)
 	fake.failPath(snapshotPath, http.StatusTooManyRequests, "1", 1)
-	_, _, _, err := setup(t, fake, testKey, func(c *config) { c.initWait = 5 * time.Second })
+	_, _, _, err := setup(t, fake, testKey, func(c *config) { c.initWait, c.maxBackoff = 5*time.Second, 2*time.Second })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -676,7 +676,7 @@ func TestConnectedOnlyAfterTheFirstFrame(t *testing.T) {
 
 func TestPollingHonoursRetryAfter(t *testing.T) {
 	fake := newFakeDataPlane(t, testKey, snapshotJSON(1, testFlag{"a", true, 1}), 1)
-	_, _, _, err := setup(t, fake, testKey)
+	_, _, _, err := setup(t, fake, testKey, func(c *config) { c.maxBackoff = 2 * time.Second })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -692,11 +692,15 @@ func TestPollingHonoursRetryAfter(t *testing.T) {
 }
 
 func TestRetryAfterJitter(t *testing.T) {
-	p := New(testKey, fast)
+	p := New(testKey, fast, func(c *config) { c.maxBackoff = 2 * time.Second })
 	for range 200 {
 		d := p.backoff(1, time.Second)
 		if d < time.Second || d > 1200*time.Millisecond {
 			t.Fatalf("backoff with Retry-After 1s = %s, want 1s–1.2s", d)
+		}
+		// Retry-After is capped at maxBackoff.
+		if d := p.backoff(1, time.Hour); d < 2*time.Second || d > 2400*time.Millisecond {
+			t.Fatalf("backoff with Retry-After 1h = %s, want 2s–2.4s", d)
 		}
 	}
 	if jitterUp(0) != 0 {
@@ -788,4 +792,34 @@ func TestUnpinnedCores(t *testing.T) {
 			t.Fatalf("this module resolves untested cores: %v", got)
 		}
 	}
+}
+
+func TestEndReasons(t *testing.T) {
+	t.Run("shutdown reconnects after a short delay", func(t *testing.T) {
+		fake := newFakeDataPlane(t, testKey, snapshotJSON(1, testFlag{"a", true, 1}), 1)
+		_, _, _, err := setup(t, fake, testKey, func(c *config) { c.minBackoff, c.maxBackoff = 200*time.Millisecond, time.Second })
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitStreams(t, fake, 1)
+		ended := time.Now()
+		fake.endStreams("shutdown")
+		fake.waitFor("the reconnect", 5*time.Second, func() bool { return len(fake.requestsTo(streamPath)) == 2 })
+		if gap := fake.requestsTo(streamPath)[1].at.Sub(ended); gap < 100*time.Millisecond {
+			t.Fatalf("reconnected after %s, want the jittered 100–200 ms delay", gap)
+		}
+	})
+	t.Run("an unknown reason is a failure with backoff", func(t *testing.T) {
+		fake := newFakeDataPlane(t, testKey, snapshotJSON(1, testFlag{"a", true, 1}), 1)
+		_, _, _, err := setup(t, fake, testKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Every stream ends at once with an unknown reason: failures count up to polling.
+		for range 3 {
+			waitStreams(t, fake, 1)
+			fake.endStreams("mystery")
+		}
+		fake.waitFor("polling", 5*time.Second, func() bool { return len(fake.requestsTo(snapshotPath)) >= 2 })
+	})
 }
