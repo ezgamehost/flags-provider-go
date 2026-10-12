@@ -1,0 +1,79 @@
+name: CI
+
+# check: gofmt, vet, staticcheck and go test -race, including every conformance vector in
+# testdata/vectors (synced from flags-stack by scripts/sync-vectors.sh).
+# vectors: testdata/vectors is exactly flags-stack's protocol/vectors/eval at .flags-stack-rev.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Both supported Go releases: go.mod declares the older one (flagd's Go core needs 1.26).
+  check:
+    name: check (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.26.x", "1.27.x"]
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      # staticcheck v0.8.1 can't read go1.27.2's export data (version 5), so it runs on 1.26.
+      - if: matrix.go == '1.26.x'
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+      - run: go build ./...
+      - run: go test -race ./...
+
+  # flags-stack is internal: the job reads it with the FLAGS_STACK_DEPLOY_KEY secret (a read-only
+  # deploy key on flags-stack), and fails on a push to main when the secret is missing (so a
+  # deleted key can't turn main silently green). Pull requests without it (forks get no secrets)
+  # skip with a notice.
+  vectors:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - id: token
+        env:
+          TOKEN: ${{ secrets.FLAGS_STACK_DEPLOY_KEY }}
+        run: |
+          if [ -n "$TOKEN" ]; then echo "present=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            echo "::error title=vectors can't run::FLAGS_STACK_DEPLOY_KEY isn't set, so this job can't read ezgamehost/flags-stack. On main that's a failure, not a skip: restore the deploy key."; exit 1
+          else echo "::notice title=vectors skipped::FLAGS_STACK_DEPLOY_KEY isn't available to this pull request; the vectors weren't compared with flags-stack."; fi
+      - if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - if: steps.token.outputs.present == 'true'
+        id: rev
+        run: echo "sha=$(cat .flags-stack-rev)" >> "$GITHUB_OUTPUT"
+      - if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: ezgamehost/flags-stack
+          ref: ${{ steps.rev.outputs.sha }}
+          ssh-key: ${{ secrets.FLAGS_STACK_DEPLOY_KEY }}
+          path: .flags-stack
+          persist-credentials: false
+      - if: steps.token.outputs.present == 'true'
+        name: vendored vectors match flags-stack
+        run: diff -r --exclude SOURCE .flags-stack/protocol/vectors/eval testdata/vectors
